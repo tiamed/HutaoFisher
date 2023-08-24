@@ -7,24 +7,33 @@ const BoxInfo refBBox = {float(NanoDet_InputSize[1]) / 2 - 16,
                          1,
                          0};  // represent the center of image
 
-// 0: fruit paste 1: redrot 2: false worm 3: fake fly 4: sugardew
+/* 0: fruit paste 1: redrot 2: false worm 3: fake fly 4: sugardew 5: sour 6:
+ * flashing*/
 // index represents (fish_lable - 1)
-const int baitList[FISH_CLASS_NUM] = {0, 0, 1, 3, 2, 3, 3, 3, 4, 4};
+const int baitList[FISH_CLASS_NUM] = {0, 0, 1, 3, 2, 3, 3, 3, 4, 4, 5, 6};
 
-// BGR format
-const int baitColor[BAIT_CLASS_NUM][3] = {{86, 132, 216},
-                                          {74, 79, 192},
-                                          {0, 174, 243},
-                                          {254, 67, 168},
-                                          {172, 92, 123}};
+const std::vector<std::string> typeNames{"rod",
+                                         "err_rod",
+                                         "medaka",
+                                         "large_medaka",
+                                         "stickleback",
+                                         "koi",
+                                         "butterflyfish",
+                                         "pufferfish",
+                                         "formalo_ray",
+                                         "divda_ray",
+                                         "angler",
+                                         "axe_marlin",
+                                         "heartfeather_bass",
+                                         "maintenance_mek"};
 
-const std::vector<std::string> typeNames{
-    "rod",         "err_rod",   "medaka",        "large_medaka",
-    "stickleback", "koi",       "butterflyfish", "pufferfish",
-    "formalo_ray", "divda_ray", "angler",        "axe_marlin"};
-
-const std::vector<std::string> baitNames{"fruit paste", "redrot", "false worm",
-                                         "fake fly", "sugardew"};
+const std::vector<std::string> baitNames{"fruit paste",
+                                         "redrot",
+                                         "false worm",
+                                         "fake fly",
+                                         "sugardew",
+                                         "sour",
+                                         "flashing maintenance mek"};
 
 const int controlColor = 250;  // grayscale
 
@@ -147,11 +156,39 @@ Fisher::Fisher(NanoDet *fishnet, Screen *screen, std::string imgPath,
   leftEdgeImg = cv::imread(imgPath + "/leftEdge.png", cv::IMREAD_GRAYSCALE);
   rightEdgeImg = cv::imread(imgPath + "/rightEdge.png", cv::IMREAD_GRAYSCALE);
 
+  for (int i = 0; i < BAIT_CLASS_NUM; i++) {
+    baitImgs[i] = cv::imread(imgPath + "/" + baitNames[i] + ".png");
+  }
+
+  logAllImgs = config["logAllImgs"];
+  logData = config["logData"];
+
+  system(("if not exist " + logPath + "\\images mkdir " + logPath + "\\images").c_str());
+  if (logData) {
+    std::fstream data;
+    data.open(logPath + "\\data.csv", std::ios::in);
+    if (!data.good()) {
+      std::cout << "log file does not exist -- create log file." << std::endl;
+      data.open(logPath + "\\data.csv", std::ios::out);
+      data << "time,bite_time,rod_x1,rod_x2,rod_y1,rod_y2,fish_x1,"
+              "fish_x2,fish_y1,fish_y2,fish_label,success"
+           << std::endl;
+    }
+    data.close();
+  }
+
   for (int i = 0; i < FISH_CLASS_NUM; i++) {
     typeToFish[i] = config["typeToFish"][typeNames[i + NON_FISH_CLASS_NUM]];
   }
-  this->logAllImgs = config["logAllImgs"];
-  this->logData = config["logData"];
+  MaxFailNum = config["MaxFailNum"];
+  MaxRodTries = config["MaxRodTries"];
+  MaxThrowFailNum = config["MaxThrowFailNum"];
+  MaxThrowWaiting = config["MaxThrowWaiting"];
+  for (int i = 0; i < FISH_CLASS_NUM; i++) {
+    MaxBiteWaiting[i] =
+        config["MaxBiteWaiting"][typeNames[NON_FISH_CLASS_NUM + i]];
+  }
+  MaxControlWaiting = config["MaxControlWaiting"];
 
   bait = -1;
 
@@ -337,11 +374,13 @@ void Fisher::chooseBait() {
     bait = baitList[targetFish.label - 2];
   }
 
-  int color[3];
-  memcpy(color, baitColor[bait], 3 * sizeof(int));
-
   mouseEvent(MOUSEEVENTF_RIGHTDOWN, 0, 0);
   mouseEvent(MOUSEEVENTF_RIGHTUP, 0, 0);
+
+  mouseEvent(
+      MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE, 23333,
+      45965);  // move the mouse away from the baits to prevent
+               // mismatching, 23333 45965 is the pos of the cancel button
 
   Sleep(300);  // wait for the window to pop
 
@@ -350,24 +389,21 @@ void Fisher::chooseBait() {
   cv::resize(screenImage, baitScreenshot,
              cv::Size(processShape[0], processShape[1]));
 
-  // x, y is in the region of bait images
-  checkWorking();
-  int x, y = 268;
-  bool found = false;
-  for (x = 379; x < 647; x++) {
-    cv::Vec3b &screencolor = (baitScreenshot.at<cv::Vec3b>(cv::Point(x, y)));
-    if (colorDiff(color, screencolor) < 28) {  // an empirical threshold
-      // cv::imwrite("../../bait.png", baitScreenshot);
-      // printf("pos %d %d  rgb %d %d %d %lf\n", x, y, screencolor[2],
-      //        screencolor[1], screencolor[0], colorDiff(color, screencolor));
-      found = true;
-      break;
-    }
-  }
+  cv::Mat score;
+  double minScore;
+  cv::Point minIdx;
 
-  if (!found) {
-    // click cancel button, 23333 45965 is the pos of the button
-    mouseEvent(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE, 23333, 45965);
+  checkWorking();
+
+  cv::matchTemplate(baitScreenshot, baitImgs[bait], score,
+                    cv::TM_SQDIFF);  // just scanning over the whole screen in
+                                     // fact doesn't cost much time (~30ms).....
+  cv::minMaxLoc(score, &minScore, nullptr, &minIdx, nullptr);
+
+  std::cout << "template diff: " << minScore << "/" << 2e6 << std::endl;
+
+  if (minScore > 2e6) {  // not found, 2e6 is an empirical threshold
+    // click cancel button
     mouseEvent(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN, 23333, 45965);
     mouseEvent(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP, 23333, 45965);
     throw "choose bait error: cannot find a proper bait!";
@@ -376,16 +412,16 @@ void Fisher::chooseBait() {
   // click the position of bait
   checkWorking();
   mouseEvent(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
-             double(x) / double(processShape[0]) * 65535,
-             double(y) / double(processShape[1]) * 65535);
+             double(minIdx.x + 29) / double(processShape[0]) * 65535,
+             double(minIdx.y + 29) / double(processShape[1]) * 65535);
   mouseEvent(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN,
-             double(x) / double(processShape[0]) * 65535,
-             double(y) / double(processShape[1]) * 65535);
+             double(minIdx.x + 29) / double(processShape[0]) * 65535,
+             double(minIdx.y + 29) / double(processShape[1]) * 65535);
   mouseEvent(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP,
-             double(x) / double(processShape[0]) * 65535,
-             double(y) / double(processShape[1]) * 65535);
+             double(minIdx.x + 29) / double(processShape[0]) * 65535,
+             double(minIdx.y + 29) / double(processShape[1]) * 65535);
 
-  // click confirm button, 44543 45965 is the pos of the button
+  // click confirm button, 44543 45965 is its position
   checkWorking();
   Sleep(300);
   mouseEvent(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE, 44543, 45965);
@@ -469,7 +505,7 @@ void Fisher::throwRod() {
           fishes.push_back(*i);
         }
       }
-      if (fishFailNum == MaxFishFailNum) {
+      if (fishFailNum == MaxThrowFailNum) {
         if (err_rods.empty()) {
           cancelThrowRod(false);
           printf("\n");
@@ -501,7 +537,7 @@ void Fisher::throwRod() {
               fishes.begin(), fishes.end(),
               [err_rod](BoxInfo bbox1, BoxInfo bbox2) {
                 return bboxDist(err_rod, bbox1) < bboxDist(err_rod, bbox2);
-              });  // find the fish closest to err_rod
+              });  // find the fish farthest to err_rod
 
           dx =
               (farthestFish.x1 + farthestFish.x2 - err_rod.x1 - err_rod.x2) / 2;
@@ -515,7 +551,7 @@ void Fisher::throwRod() {
     }
 
     if (targetFishes.empty()) {
-      if (fishFailNum == MaxFishFailNum) {
+      if (fishFailNum == MaxThrowFailNum) {
         cancelThrowRod(false);
         printf("\n");
         throw "throw rod error: cannot find target fish within acceptable tries!";
@@ -525,7 +561,7 @@ void Fisher::throwRod() {
           imgLog("targetFish", true);
         }
         fishFailNum++;
-        // random move to try to rediscover the fish
+        // random move to try to retrieve the fish
         double ang = angDistrib(engine);
         mouseEvent(MOUSEEVENTF_MOVE, dx / 2, dy / 2);
         mouseEvent(MOUSEEVENTF_MOVE, 160 * cos(ang), 90 * sin(ang));
@@ -553,7 +589,7 @@ void Fisher::throwRod() {
 
     switch (getRodState(rod, targetFish)) {
       case -1:
-        if (fishFailNum == MaxFishFailNum) {
+        if (fishFailNum == MaxThrowFailNum) {
           cancelThrowRod(false);
           printf("\n");
           throw "throw rod error: get rod state: Newton-Raphson method cannot converge within iteration limit!";
@@ -619,7 +655,7 @@ void Fisher::checkBite() {
     throw "checkBite: the float doesn't splash within acceptable time!";
   }
 
-  double biteTime;
+  double biteTime = 0;
   while (double(clock() - startTime) / CLOCKS_PER_SEC <
          MaxBiteWaiting[targetFish.label - 2]) {
     checkWorking();
@@ -627,8 +663,8 @@ void Fisher::checkBite() {
     cv::cvtColor(biteImage, gray, cv::COLOR_BGR2GRAY);
     cv::resize(gray, resized, cv::Size(processShape[0], processShape[1]));
     // the position of hook icon too
-    cv::Canny(resized(cv::Rect(850, 508, 41, 41)), edge, 50, 150);
-    if (cv::PSNR(edge, pullImg) > 10) {
+    cv::Canny(resized(cv::Rect(850, 508, 41, 41)), edge, 100, 200);
+    if (cv::PSNR(edge, pullImg) > 8.5) {  // a carefully selected value :)
       biteSuccess = true;
       biteTime = double(clock() - startTime) / CLOCKS_PER_SEC;
       break;
@@ -654,10 +690,10 @@ void Fisher::checkBite() {
       std::ofstream data;
       data.open(logPath + "\\data.csv", std::ios::app);
       char output[1024];
-      sprintf(output, "%d, %f, %f, %f, %f, %f, %f, %f, %f, %d, %d",
-              int(time(0)), rod.x1, rod.x2, rod.y1, rod.y2, targetFish.x1,
-              targetFish.x2, targetFish.y1, targetFish.y2, targetFish.label - 2,
-              biteState);
+      sprintf(output, "%d, %f, %f, %f, %f, %f, %f, %f, %f, %f, %d, %d",
+              int(time(0)), biteTime, rod.x1, rod.x2, rod.y1, rod.y2,
+              targetFish.x1, targetFish.x2, targetFish.y1, targetFish.y2,
+              targetFish.label - 2, biteState);
       data << output << std::endl;
       data.close();
     }
@@ -688,7 +724,7 @@ void Fisher::control() {
     screenImage = screen->getScreenshot();
     cv::cvtColor(screenImage, gray, cv::COLOR_BGR2GRAY);
     cv::resize(gray, resized, cv::Size(processShape[0], processShape[1]));
-    //(498,0,28,216) is the possible position of progress ring
+    //(504,0,16,216) is the possible position of progress ring
     cv::matchTemplate(resized(cv::Rect(504, 0, 16, 216)), centralBarImg, score,
                       cv::TM_CCOEFF_NORMED);
     cv::minMaxLoc(score, nullptr, &maxScore, nullptr, &maxIdx);
@@ -842,7 +878,7 @@ void Fisher::fishing() {
       while (!working) {
         Sleep(100);  // wait for fisher launch
       }
-      while (working && (fishingFailCnt < 3) && scanFish()) {
+      while (working && (fishingFailCnt < MaxFailNum) && scanFish()) {
         printf("Fisher: Begin to try to catch a fish!\n");
         try {
           selectFish();
@@ -863,7 +899,7 @@ void Fisher::fishing() {
         }
       }
       if (working) {
-        if (fishingFailCnt >= 3) {
+        if (fishingFailCnt >= MaxFailNum) {
           Sleep(250);
           printf(
               "Fisher: Warning! fisher failed too many times. Please check.\n");
@@ -961,7 +997,7 @@ void Fisher::getRodData() {
             return bboxDist(rod, bbox1) < bboxDist(rod, bbox2);
           });  // find the closest fish
 
-      std::cout << "nearest fish: " << labels[targetFish.label] << std::endl;
+      std::cout << "nearest fish: " << typeNames[targetFish.label] << std::endl;
 
       int success;
       printf("Successed? 0: success 1: too close 2: too far              ");
